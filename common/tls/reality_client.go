@@ -47,6 +47,7 @@ var _ ConfigCompat = (*RealityClientConfig)(nil)
 
 type RealityClientConfig struct {
 	ctx           context.Context
+	logger        logger.ContextLogger
 	uClient       *UTLSClientConfig
 	publicKey     []byte
 	shortID       [8]byte
@@ -100,7 +101,7 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		}
 	}
 
-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID, mldsa65Verify}
+	var config Config = &RealityClientConfig{ctx, logger, uClient.(*UTLSClientConfig), publicKey, shortID, mldsa65Verify}
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -205,16 +206,15 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		return nil, E.New("nil KeyShareKeys")
 	}
 	ecdheKey := keyShareKeys.Ecdhe
-	// When ML-KEM is the first advertised group the server derives the REALITY
-	// auth key from the X25519 half inside the hybrid key share, not from the
-	// standalone X25519 share. metacubex/utls fills Ecdhe from the standalone
-	// share, so using it here produced a different AuthKey and every such
-	// handshake ended in "reality verification failed".
-	if preferredKeyShareGroup(uConn) == utls.X25519MLKEM768 && keyShareKeys.MlkemEcdhe != nil {
-		ecdheKey = keyShareKeys.MlkemEcdhe
-	}
+	keyShareName := "x25519"
+	// Xray and sing-box REALITY servers derive the auth key from the client's
+	// standalone X25519 key share when the ClientHello offers both; the X25519
+	// half inside the hybrid X25519MLKEM768 share is only their fallback for a
+	// ClientHello without a standalone share. Xray's own client asks for Ecdhe
+	// first and falls back to MlkemEcdhe, so do the same here.
 	if ecdheKey == nil {
 		ecdheKey = keyShareKeys.MlkemEcdhe
+		keyShareName = "x25519mlkem768"
 	}
 	if ecdheKey == nil {
 		return nil, E.New("nil ecdheKey")
@@ -250,6 +250,13 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 
 	if !verifier.verified {
+		// The auth key is derived before the handshake, so a mismatch here means
+		// the server computed it from another key share. Name the choice in the
+		// log: it is the only way to tell a fingerprint/server mismatch from a
+		// wrong public key without a packet capture.
+		e.logger.WarnContext(ctx, "reality: verification failed (auth key from ", keyShareName,
+			", standalone X25519 share present: ", keyShareKeys.Ecdhe != nil,
+			", hybrid X25519MLKEM768 share present: ", keyShareKeys.MlkemEcdhe != nil, ")")
 		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
 		return nil, E.New("reality verification failed")
 	}
@@ -292,6 +299,7 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 func (e *RealityClientConfig) Clone() Config {
 	return &RealityClientConfig{
 		e.ctx,
+		e.logger,
 		e.uClient.Clone().(*UTLSClientConfig),
 		e.publicKey,
 		e.shortID,
@@ -383,22 +391,6 @@ func (c *realityClientConnWrapper) ConnectionState() tls.ConnectionState {
 
 func (c *realityClientConnWrapper) Upstream() any {
 	return c.UConn
-}
-
-// preferredKeyShareGroup is the first non-GREASE group in the ClientHello; the
-// server selects its key share from the same order.
-func preferredKeyShareGroup(uConn *utls.UConn) utls.CurveID {
-	if uConn.HandshakeState.Hello == nil {
-		return 0
-	}
-	for _, curveID := range uConn.HandshakeState.Hello.SupportedCurves {
-		value := uint16(curveID)
-		if value>>8 == value&0xff && value&0x0f == 0x0a {
-			continue // GREASE
-		}
-		return curveID
-	}
-	return 0
 }
 
 // Due to low implementation quality, the reality server intercepted half close and caused memory leaks.
