@@ -39,6 +39,9 @@ type UTLSClientConfig struct {
 	recordFragment        bool
 	spoof                 string
 	spoofMethod           tlsspoof.Method
+	mixedCaseSNI          bool
+	paddingSize           option.IntRange
+	customSNI             string
 }
 
 func (c *UTLSClientConfig) ServerName() string {
@@ -56,7 +59,18 @@ func (c *UTLSClientConfig) SetServerName(serverName string) {
 		}
 		return
 	}
-	c.config.ServerName = serverName
+	wireName := serverName
+	if c.customSNI != "" {
+		wireName = c.customSNI
+		if c.verifyServerName {
+			c.config.InsecureServerNameToVerify = serverName
+		}
+	}
+	if c.mixedCaseSNI {
+		c.config.ServerName = randomizeCase(wireName)
+		return
+	}
+	c.config.ServerName = wireName
 }
 
 func (c *UTLSClientConfig) NextProtos() []string {
@@ -85,12 +99,25 @@ func (c *UTLSClientConfig) STDConfig() (*STDConfig, error) {
 func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
 	if c.fragment || c.recordFragment {
 		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
+		return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
 	}
 	conn, err := applyTLSSpoof(conn, c.spoof, c.spoofMethod)
 	if err != nil {
 		return nil, err
 	}
-	return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
+	var uConn *utls.UConn
+	if c.id != utls.HelloCustom {
+		uConn = utls.UClient(conn, c.config.Clone(), c.id)
+	} else {
+		// A custom fingerprint means the ClientHello is assembled by hand so a
+		// padding extension of the configured size can be spliced into it.
+		uConn = utls.UClient(conn, c.config.Clone(), randomFingerprint)
+		uConn, err = makeTLSHelloPacketWithPadding(uConn, c.paddingSize, c.config.ServerName)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &utlsALPNWrapper{utlsConnWrapper{UConn: uConn}, c.config.NextProtos}, nil
 }
 
 func (c *UTLSClientConfig) SetSessionIDGenerator(generator func(clientHello []byte, sessionID []byte) error) {
@@ -111,6 +138,9 @@ func (c *UTLSClientConfig) Clone() Config {
 		recordFragment:        c.recordFragment,
 		spoof:                 c.spoof,
 		spoofMethod:           c.spoofMethod,
+		mixedCaseSNI:          c.mixedCaseSNI,
+		paddingSize:           c.paddingSize,
+		customSNI:             c.customSNI,
 	}
 	cloned.SetServerName(cloned.serverName)
 	return cloned
@@ -307,6 +337,13 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if err != nil {
 		return nil, err
 	}
+	var paddingSize option.IntRange
+	if options.TLSTricks != nil && options.TLSTricks.PaddingMode == "random" {
+		paddingSize, err = option.Parse2IntRange(options.TLSTricks.PaddingSize)
+		if err != nil {
+			return nil, E.Cause(err, "invalid padding size supplied")
+		}
+	}
 	var config Config = &UTLSClientConfig{
 		ctx:                   ctx,
 		config:                &tlsConfig,
@@ -320,6 +357,8 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 		recordFragment:        options.RecordFragment,
 		spoof:                 spoof,
 		spoofMethod:           spoofMethod,
+		mixedCaseSNI:          options.TLSTricks != nil && options.TLSTricks.MixedCaseSNI,
+		paddingSize:           paddingSize,
 	}
 	config.SetServerName(serverName)
 	if options.ECH != nil && options.ECH.Enabled {
@@ -392,6 +431,8 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
 		return randomFingerprint, nil
 	case "randomized":
 		return randomizedFingerprint, nil
+	case "custom":
+		return utls.HelloCustom, nil
 	default:
 		return utls.ClientHelloID{}, E.New("unknown uTLS fingerprint: ", name)
 	}

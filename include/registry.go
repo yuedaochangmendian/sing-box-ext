@@ -23,9 +23,12 @@ import (
 	"github.com/sagernet/sing-box/protocol/block"
 	"github.com/sagernet/sing-box/protocol/bridge"
 	"github.com/sagernet/sing-box/protocol/direct"
+	"github.com/sagernet/sing-box/protocol/dnstt"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/masque"
+	"github.com/sagernet/sing-box/protocol/masterdns"
+	"github.com/sagernet/sing-box/protocol/mieru"
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing-box/protocol/redirect"
@@ -36,6 +39,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/ssh"
 	"github.com/sagernet/sing-box/protocol/tor"
 	"github.com/sagernet/sing-box/protocol/trojan"
+	"github.com/sagernet/sing-box/protocol/trusttunnel"
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing-box/protocol/vmess"
@@ -70,6 +74,8 @@ func InboundRegistry() *inbound.Registry {
 	shadowtls.RegisterInbound(registry)
 	vless.RegisterInbound(registry)
 	anytls.RegisterInbound(registry)
+	mieru.RegisterInbound(registry)
+	trusttunnel.RegisterInbound(registry)
 
 	registerQUICInbounds(registry)
 	registerCloudflaredInbound(registry)
@@ -89,6 +95,7 @@ func OutboundRegistry() *outbound.Registry {
 
 	group.RegisterSelector(registry)
 	group.RegisterURLTest(registry)
+	group.RegisterAutoSelector(registry)
 
 	socks.RegisterOutbound(registry)
 	http.RegisterOutbound(registry)
@@ -99,9 +106,13 @@ func OutboundRegistry() *outbound.Registry {
 	registerNaiveOutbound(registry)
 	tor.RegisterOutbound(registry)
 	ssh.RegisterOutbound(registry)
+	dnstt.RegisterOutbound(registry)
+	masterdns.RegisterOutbound(registry)
 	shadowtls.RegisterOutbound(registry)
 	vless.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
+	mieru.RegisterOutbound(registry)
+	trusttunnel.RegisterOutbound(registry)
 
 	registerQUICOutbounds(registry)
 	registerTailcatOutbound(registry)
@@ -117,6 +128,7 @@ func EndpointRegistry() *endpoint.Registry {
 	registerOpenConnectEndpoint(registry)
 	registerOpenVPNEndpoints(registry)
 	masque.RegisterEndpoint(registry)
+	registerWARPMASQUEEndpoint(registry)
 	registerTailscaleEndpoint(registry)
 
 	return registry
@@ -127,6 +139,7 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 
 	transport.RegisterTCP(registry)
 	transport.RegisterUDP(registry)
+	transport.RegisterUnderlying(registry)
 	transport.RegisterTLS(registry)
 	transport.RegisterHTTPS(registry)
 	hosts.RegisterTransport(registry)

@@ -101,11 +101,13 @@ type AbstractDialerOptions struct {
 	UDPBindPort                uint16                            `json:"-"`
 	UDPFragment                *bool                             `json:"udp_fragment,omitempty"`
 	UDPFragmentDefault         bool                              `json:"-"`
+	QUICOpener                 bool                              `json:"quic_opener,omitempty"`
 	DomainResolver             *DomainResolveOptions             `json:"domain_resolver,omitempty"`
 	NetworkStrategy            *NetworkStrategy                  `json:"network_strategy,omitempty"`
 	NetworkType                badoption.Listable[InterfaceType] `json:"network_type,omitempty"`
 	FallbackNetworkType        badoption.Listable[InterfaceType] `json:"fallback_network_type,omitempty"`
 	FallbackDelay              badoption.Duration                `json:"fallback_delay,omitempty"`
+	TLSFragment                *TLSFragmentOptions               `json:"tls_fragment,omitempty"`
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`
