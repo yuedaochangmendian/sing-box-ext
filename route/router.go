@@ -201,7 +201,13 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if r.processSearcher != nil {
 			scope.Add(r.processSearcher.Close)
 			processCache := common.Must1(freelru.New[processCacheKey, processCacheEntry](256, maphash.NewHasher[processCacheKey]().Hash32, true))
-			processCache.SetLifetime(200 * time.Millisecond)
+			// Windows process lookups are slow enough that the default lifetime
+			// makes the cache miss most repeat queries.
+			cacheLifetime := 200 * time.Millisecond
+			if C.IsWindows {
+				cacheLifetime = 1 * time.Second
+			}
+			processCache.SetLifetime(cacheLifetime)
 			r.processCache = processCache
 		}
 	case adapter.StartStatePostStart:
@@ -230,6 +236,10 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 func (r *Router) RuleSet(tag string) (adapter.RuleSet, bool) {
 	ruleSet, loaded := r.ruleSetMap[tag]
 	return ruleSet, loaded
+}
+
+func (r *Router) RuleSets() []adapter.RuleSet {
+	return r.ruleSets
 }
 
 func (r *Router) Rules() []adapter.Rule {
