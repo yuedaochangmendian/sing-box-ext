@@ -58,6 +58,11 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	if options.ListenPort != 0 {
 		ipcConf += "\nlisten_port=" + F.ToString(options.ListenPort)
 	}
+	amneziaConf, err := options.AmneziaWG.GenerateIpcLines()
+	if err != nil {
+		return nil, err
+	}
+	ipcConf += amneziaConf
 	var peers []peerConfig
 	for peerIndex, rawPeer := range options.Peers {
 		peer := peerConfig{
@@ -161,6 +166,13 @@ func (e *Endpoint) Start(postStart bool) error {
 		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
 			standardBind.SetSinglePeerMode()
 		}
+		quicOpenerDialer, isQUICOpenerDialer := common.Cast[dialer.QUICOpenerDialer](e.options.Dialer)
+		if isQUICOpenerDialer {
+			newOpener := quicOpenerDialer.QUICOpener()
+			if newOpener != nil {
+				standardBind.SetFlowOpener(newOpener)
+			}
+		}
 		if egressEnabled {
 			egressPoolOptions := e.options.EgressPoolOptions
 			egressPoolOptions.Control = listenerControl
@@ -186,15 +198,18 @@ func (e *Endpoint) Start(postStart bool) error {
 	} else {
 		var (
 			isConnect   bool
-			connectAddr netip.AddrPort
+			connectAddr M.Socksaddr
 			reserved    [3]uint8
 		)
 		if len(e.peers) == 1 {
 			reserved = e.peers[0].reserved
 			if e.peers[0].endpoint.IsValid() {
-				isConnect = true
-				connectAddr = e.peers[0].endpoint
+				connectAddr = M.SocksaddrFromNetIP(e.peers[0].endpoint)
+			} else {
+				// Detours may bind UDP to the ListenPacket destination, so a domain peer is dialed and resolved per connect.
+				connectAddr = e.peers[0].destination
 			}
+			isConnect = connectAddr.IsValid()
 		}
 		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, isConnect, connectAddr, reserved)
 	}
@@ -398,7 +413,7 @@ type peerConfig struct {
 	publicKey       device.NoisePublicKey
 	preSharedKeyHex string
 	allowedIPs      []netip.Prefix
-	keepalive       uint16
+	keepalive       string
 	reserved        [3]uint8
 }
 
@@ -414,8 +429,8 @@ func (c peerConfig) GenerateIpcLines() string {
 	for _, allowedIP := range c.allowedIPs {
 		ipcLines.WriteString("\nallowed_ip=" + allowedIP.String())
 	}
-	if c.keepalive > 0 {
-		ipcLines.WriteString("\npersistent_keepalive_interval=" + F.ToString(c.keepalive))
+	if c.keepalive != "" {
+		ipcLines.WriteString("\npersistent_keepalive_interval=" + c.keepalive)
 	}
 	return ipcLines.String()
 }

@@ -135,6 +135,7 @@ type OutboundTLSOptions struct {
 	ECH                        *OutboundECHOptions             `json:"ech,omitempty"`
 	UTLS                       *OutboundUTLSOptions            `json:"utls,omitempty"`
 	Reality                    *OutboundRealityOptions         `json:"reality,omitempty"`
+	TLSTricks                  *TLSTricksOptions               `json:"tls_tricks,omitempty"`
 }
 
 type OutboundTLSOptionsContainer struct {
@@ -252,7 +253,8 @@ type OutboundUTLSOptions struct {
 }
 
 type OutboundRealityOptions struct {
-	Enabled   bool   `json:"enabled,omitempty"`
-	PublicKey string `json:"public_key,omitempty"`
-	ShortID   string `json:"short_id,omitempty"`
+	Enabled       bool   `json:"enabled,omitempty"`
+	PublicKey     string `json:"public_key,omitempty"`
+	ShortID       string `json:"short_id,omitempty"`
+	MLDSA65Verify string `json:"mldsa65_verify,omitempty"`
 }
