@@ -157,17 +157,18 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
-	verifier.UConn = uConn
-	err := uConn.BuildHandshakeState()
+	uConn, err := newRealityUConn(conn, uConfig, e.uClient.id)
 	if err != nil {
 		return nil, err
 	}
-	// Xray-core v26.9.8+ REALITY servers require the hybrid X25519MLKEM768 key
-	// share. The old code filtered it out, which made every such server fail with
-	// "reality verification failed"; keep the fingerprint's curves and key shares
-	// untouched. A fingerprint that never offered ML-KEM is left as-is: advertising
-	// the group without generating a key share would be an invalid ClientHello.
+	verifier.UConn = uConn
+	err = uConn.BuildHandshakeState()
+	if err != nil {
+		return nil, err
+	}
+	// Xray-core v26.9.8+ REALITY servers reject a ClientHello without a hybrid
+	// X25519MLKEM768 key share; newRealityUConn adds one to fingerprints that
+	// predate ML-KEM (firefox, safari, ios, edge, android, 360, qq).
 	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
 			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
@@ -256,12 +257,91 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		// wrong public key without a packet capture.
 		e.logger.WarnContext(ctx, "reality: verification failed (auth key from ", keyShareName,
 			", standalone X25519 share present: ", keyShareKeys.Ecdhe != nil,
-			", hybrid X25519MLKEM768 share present: ", keyShareKeys.MlkemEcdhe != nil, ")")
+			", hybrid X25519MLKEM768 share present: ", keyShareKeys.MlkemEcdhe != nil,
+			", fingerprint: ", e.uClient.id.Client, "-", e.uClient.id.Version, ")")
 		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
 		return nil, E.New("reality verification failed")
 	}
 
 	return &realityClientConnWrapper{uConn}, nil
+}
+
+// newRealityUConn builds the uTLS connection for [id]. REALITY servers from
+// Xray v26.9.8 on reject a ClientHello that carries no X25519MLKEM768 key
+// share, so a fingerprint that predates ML-KEM gets one before its spec is
+// applied. The configured fingerprint is kept: only the curve list and the key
+// share extension gain the group, everything else is the fingerprint's own.
+func newRealityUConn(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
+	spec, err := utls.UTLSIdToSpec(id)
+	if err != nil {
+		// HelloRandomized builds its spec per connection, HelloCustom and
+		// HelloGolang have none. REALITY cannot add a key share to any of them,
+		// so fall back to Chrome, the modern preset every REALITY server
+		// accepts.
+		return utls.UClient(conn, config, utls.HelloChrome_Auto), nil
+	}
+	changed, usable := ensureMLKEMKeyShare(&spec)
+	if !usable {
+		// TLS 1.2-only presets (360, Android 11) have no key share extension;
+		// REALITY is TLS 1.3 only, so their spec can never carry the handshake.
+		return utls.UClient(conn, config, utls.HelloChrome_Auto), nil
+	}
+	if !changed {
+		return utls.UClient(conn, config, id), nil
+	}
+	// ApplyPreset needs HelloCustom: the spec is what goes on the wire, and the
+	// configured id no longer describes it.
+	uConn := utls.UClient(conn, config, utls.HelloCustom)
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		return nil, err
+	}
+	return uConn, nil
+}
+
+// ensureMLKEMKeyShare puts the hybrid X25519MLKEM768 group and key share into
+// [spec], first, the order Chrome uses. It reports whether the spec changed and
+// whether the spec can carry a TLS 1.3 REALITY handshake at all.
+func ensureMLKEMKeyShare(spec *utls.ClientHelloSpec) (changed, usable bool) {
+	var curves *utls.SupportedCurvesExtension
+	var keyShares *utls.KeyShareExtension
+	offersTLS13 := spec.TLSVersMax >= utls.VersionTLS13
+	for _, extension := range spec.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves = ext
+		case *utls.KeyShareExtension:
+			keyShares = ext
+		case *utls.SupportedVersionsExtension:
+			for _, version := range ext.Versions {
+				if version == utls.VersionTLS13 {
+					offersTLS13 = true
+				}
+			}
+		}
+	}
+	if keyShares == nil || !offersTLS13 {
+		return false, false
+	}
+	if curves != nil {
+		hasCurve := false
+		for _, curveID := range curves.Curves {
+			if curveID == utls.X25519MLKEM768 {
+				hasCurve = true
+				break
+			}
+		}
+		if !hasCurve {
+			curves.Curves = append([]utls.CurveID{utls.X25519MLKEM768}, curves.Curves...)
+			changed = true
+		}
+	}
+	for _, share := range keyShares.KeyShares {
+		if share.Group == utls.X25519MLKEM768 {
+			return changed, true
+		}
+	}
+	keyShares.KeyShares = append([]utls.KeyShare{{Group: utls.X25519MLKEM768}}, keyShares.KeyShares...)
+	return true, true
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
