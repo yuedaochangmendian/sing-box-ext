@@ -1,0 +1,228 @@
+package trafficcontrol
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/compatible"
+	"github.com/sagernet/sing/common/cleanup"
+	"github.com/sagernet/sing/common/observable"
+	"github.com/sagernet/sing/common/x/list"
+
+	"github.com/gofrs/uuid/v5"
+)
+
+type ConnectionEventType int
+
+const (
+	ConnectionEventNew ConnectionEventType = iota
+	ConnectionEventClosed
+)
+
+type ConnectionEvent struct {
+	Type     ConnectionEventType
+	ID       uuid.UUID
+	Metadata *TrackerMetadata
+	ClosedAt time.Time
+}
+
+const closedConnectionsLimit = 1000
+
+var (
+	_ adapter.ConnectionTracker = (*Manager)(nil)
+	_ adapter.LifecycleService  = (*Manager)(nil)
+)
+
+type Manager struct {
+	uploadMap   compatible.Map[string, *atomic.Int64]
+	downloadMap compatible.Map[string, *atomic.Int64]
+
+	connections             compatible.Map[uuid.UUID, Tracker]
+	closedConnectionsAccess sync.Mutex
+	closedConnections       list.List[TrackerMetadata]
+	closedUploadTotal       int64
+	closedDownloadTotal     int64
+
+	eventSubscriber *observable.Subscriber[ConnectionEvent]
+	eventObserver   *observable.Observer[ConnectionEvent]
+}
+
+func NewManager() *Manager {
+	return &Manager{
+		eventSubscriber: observable.NewSubscriber[ConnectionEvent](256),
+	}
+}
+
+func (m *Manager) Name() string {
+	return "traffic manager"
+}
+
+func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage == adapter.StartStateInitialize {
+		m.eventObserver = observable.NewObserver(m.eventSubscriber, 64)
+		scope.Add(m.eventObserver.Close)
+		cleaner := cleanup.Add(m.Clear)
+		scope.Add(func() error {
+			cleaner.Close()
+			return nil
+		})
+	}
+	return nil
+}
+
+func (m *Manager) SubscribeEvents() (observable.Subscription[ConnectionEvent], <-chan struct{}, error) {
+	return m.eventObserver.Subscribe()
+}
+
+func (m *Manager) UnSubscribeEvents(subscription observable.Subscription[ConnectionEvent]) {
+	m.eventObserver.UnSubscribe(subscription)
+}
+
+func (m *Manager) join(tracker Tracker) {
+	metadata := tracker.Metadata()
+	m.connections.Store(metadata.ID, tracker)
+	m.eventSubscriber.Emit(ConnectionEvent{
+		Type:     ConnectionEventNew,
+		ID:       metadata.ID,
+		Metadata: metadata,
+	})
+}
+
+func (m *Manager) leave(tracker Tracker) {
+	metadata := tracker.Metadata()
+	closedAt := time.Now()
+	m.closedConnectionsAccess.Lock()
+	_, loaded := m.connections.LoadAndDelete(metadata.ID)
+	if !loaded {
+		m.closedConnectionsAccess.Unlock()
+		return
+	}
+	metadata.ClosedAt = closedAt
+	metadataCopy := *metadata
+	if m.closedConnections.Len() >= closedConnectionsLimit {
+		evicted := m.closedConnections.PopFront()
+		m.closedUploadTotal += evicted.Upload.Load()
+		m.closedDownloadTotal += evicted.Download.Load()
+	}
+	m.closedConnections.PushBack(metadataCopy)
+	m.closedConnectionsAccess.Unlock()
+	m.eventSubscriber.Emit(ConnectionEvent{
+		Type:     ConnectionEventClosed,
+		ID:       metadata.ID,
+		Metadata: &metadataCopy,
+		ClosedAt: closedAt,
+	})
+}
+
+func (m *Manager) Total() (uplinkTotal int64, downlinkTotal int64) {
+	m.closedConnectionsAccess.Lock()
+	defer m.closedConnectionsAccess.Unlock()
+	uplinkTotal = m.closedUploadTotal
+	downlinkTotal = m.closedDownloadTotal
+	for element := m.closedConnections.Front(); element != nil; element = element.Next() {
+		uplinkTotal += element.Value.Upload.Load()
+		downlinkTotal += element.Value.Download.Load()
+	}
+	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
+		metadata := tracker.Metadata()
+		uplinkTotal += metadata.Upload.Load()
+		downlinkTotal += metadata.Download.Load()
+		return true
+	})
+	return
+}
+
+// outboundCounters extends a connection's own counters with the per-outbound
+// accumulators sampled by TotalOutbound, so a single counted read or write
+// feeds both the connection metadata and the outbound totals.
+func (m *Manager) outboundCounters(outbound string, upload *atomic.Int64, download *atomic.Int64) ([]*atomic.Int64, []*atomic.Int64) {
+	if outbound == "" {
+		return []*atomic.Int64{upload}, []*atomic.Int64{download}
+	}
+	uploadCounter, _ := m.uploadMap.LoadOrStore(outbound, new(atomic.Int64))
+	downloadCounter, _ := m.downloadMap.LoadOrStore(outbound, new(atomic.Int64))
+	return []*atomic.Int64{upload, uploadCounter}, []*atomic.Int64{download, downloadCounter}
+}
+
+func (m *Manager) pushUploaded(outbound string, size int64) {
+	if outbound == "" {
+		return
+	}
+	counter, _ := m.uploadMap.LoadOrStore(outbound, new(atomic.Int64))
+	counter.Add(size)
+}
+
+func (m *Manager) pushDownloaded(outbound string, size int64) {
+	if outbound == "" {
+		return
+	}
+	counter, _ := m.downloadMap.LoadOrStore(outbound, new(atomic.Int64))
+	counter.Add(size)
+}
+
+// TotalOutbound reports the traffic accounted to an outbound since the last
+// call and resets its counters, so consumers sampling it periodically read a
+// per-interval delta rather than a running total.
+func (m *Manager) TotalOutbound(outbound string) (uplinkTotal int64, downlinkTotal int64) {
+	if counter, loaded := m.uploadMap.Load(outbound); loaded {
+		uplinkTotal = counter.Swap(0)
+	}
+	if counter, loaded := m.downloadMap.Load(outbound); loaded {
+		downlinkTotal = counter.Swap(0)
+	}
+	return
+}
+
+func (m *Manager) ConnectionsLen() int {
+	return m.connections.Len()
+}
+
+func (m *Manager) Connections() []*TrackerMetadata {
+	var connections []*TrackerMetadata
+	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
+		connections = append(connections, tracker.Metadata())
+		return true
+	})
+	return connections
+}
+
+func (m *Manager) ClosedConnections() []*TrackerMetadata {
+	m.closedConnectionsAccess.Lock()
+	values := m.closedConnections.Array()
+	m.closedConnectionsAccess.Unlock()
+	if len(values) == 0 {
+		return nil
+	}
+	connections := make([]*TrackerMetadata, len(values))
+	for i := range values {
+		connections[i] = &values[i]
+	}
+	return connections
+}
+
+func (m *Manager) Connection(id uuid.UUID) Tracker {
+	connection, loaded := m.connections.Load(id)
+	if !loaded {
+		return nil
+	}
+	return connection
+}
+
+func (m *Manager) CloseAllConnections() {
+	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
+		tracker.Close()
+		return true
+	})
+}
+
+func (m *Manager) Clear() {
+	m.closedConnectionsAccess.Lock()
+	defer m.closedConnectionsAccess.Unlock()
+	for element := m.closedConnections.Front(); element != nil; element = element.Next() {
+		m.closedUploadTotal += element.Value.Upload.Load()
+		m.closedDownloadTotal += element.Value.Download.Load()
+	}
+	m.closedConnections.Init()
+}
