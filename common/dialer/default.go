@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -25,8 +26,8 @@ import (
 )
 
 var (
-	_ ParallelInterfaceDialer = (*DefaultDialer)(nil)
-	_ UDPListener             = (*DefaultDialer)(nil)
+	_ ParallelNetworkDialer = (*DefaultDialer)(nil)
+	_ UDPListener           = (*DefaultDialer)(nil)
 )
 
 type DefaultDialer struct {
@@ -38,6 +39,7 @@ type DefaultDialer struct {
 	udpAddr4               string
 	udpAddr6               string
 	netns                  string
+	tcpFastOpen            bool
 	bindInterface          string
 	autoDetectBindFunc     control.Func
 	connectionManager      adapter.ConnectionManager
@@ -46,6 +48,7 @@ type DefaultDialer struct {
 	outboundManager        adapter.OutboundManager
 	dnsTransportManager    adapter.DNSTransportManager
 	networkStrategy        *C.NetworkStrategy
+	canUseNetworkStrategy  atomic.Bool
 	defaultNetworkStrategy bool
 	networkType            []C.InterfaceType
 	fallbackNetworkType    []C.InterfaceType
@@ -238,25 +241,9 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
 	}
-	var tlsFragment *TLSFragment = nil
-	if options.TLSFragment != nil && options.TLSFragment.Enabled {
-		tlsFragment = &TLSFragment{}
-		if options.TCPFastOpen {
-			return nil, E.New("TLS Fragmentation is not compatible with TCP Fast Open, set `tcp_fast_open` to `false` in your outbound if you intend to enable TLS fragmentation.")
-		}
-		tlsFragment.Enabled = true
-
-		sleep, err := option.Parse2IntRange(options.TLSFragment.Sleep)
-		if err != nil {
-			return nil, E.Cause(err, "invalid TLS fragment sleep period supplied")
-		}
-		tlsFragment.Sleep = sleep
-
-		size, err := option.Parse2IntRange(options.TLSFragment.Size)
-		if err != nil {
-			return nil, E.Cause(err, "invalid TLS fragment size supplied")
-		}
-		tlsFragment.Size = size
+	tlsFragment, err := NewTLSFragment(options)
+	if err != nil {
+		return nil, err
 	}
 	tcpDialer4, err := newTCPDialer(dialer4, options.TCPFastOpen, tlsFragment)
 	if err != nil {
@@ -266,7 +253,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if err != nil {
 		return nil, err
 	}
-	return &DefaultDialer{
+	defaultDialer := &DefaultDialer{
 		dialer4:                tcpDialer4,
 		dialer6:                tcpDialer6,
 		udpDialer4:             udpDialer4,
@@ -275,6 +262,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpAddr4:               udpAddr4,
 		udpAddr6:               udpAddr6,
 		netns:                  options.NetNs,
+		tcpFastOpen:            options.TCPFastOpen,
 		bindInterface:          bindInterface,
 		autoDetectBindFunc:     autoDetectBindFunc,
 		connectionManager:      connectionManager,
@@ -288,7 +276,9 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		fallbackNetworkType:    fallbackNetworkType,
 		networkFallbackDelay:   networkFallbackDelay,
 		quicOpener:             options.QUICOpener,
-	}, nil
+	}
+	defaultDialer.canUseNetworkStrategy.Store(true)
+	return defaultDialer, nil
 }
 
 func setMarkWrapper(networkManager adapter.NetworkManager, mark uint32, isDefault bool) control.Func {
@@ -313,7 +303,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 	} else if address.IsDomain() {
 		return nil, E.New("domain not resolved")
 	}
-	if d.networkStrategy == nil {
+	if d.networkStrategy == nil || !d.canUseNetworkStrategy.Load() {
 		if d.netns == "" && address.Addr.Zone() == "" && isLinkScoped(address.Addr) {
 			if d.bindInterface != "" {
 				address.Addr = address.Addr.WithZone(d.bindInterface)
@@ -347,7 +337,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 		}
 		return d.trackConn(ctx, address, conn, err)
 	} else {
-		return d.DialParallelInterface(ctx, network, address, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay)
+		return d.DialParallelNetwork(ctx, network, address, nil, nil, nil, nil, 0)
 	}
 }
 
@@ -355,21 +345,29 @@ func isLinkScoped(addr netip.Addr) bool {
 	return addr.Is6() && (addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsInterfaceLocalMulticast())
 }
 
-func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network string, address M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
-	if strategy == nil {
+func (d *DefaultDialer) DialParallelNetwork(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
+	if len(destinationAddresses) == 0 {
+		destinationAddresses = []netip.Addr{destination.Addr}
+	}
+	if d.networkStrategy == nil || !d.canUseNetworkStrategy.Load() {
+		strategy = nil
+	} else if strategy == nil {
 		strategy = d.networkStrategy
 	}
+	if fallbackDelay == 0 {
+		fallbackDelay = d.networkFallbackDelay
+	}
 	if strategy == nil {
-		return d.DialContext(ctx, network, address)
+		if d.tcpFastOpen {
+			return N.DialSerial(ctx, d, network, destination, destinationAddresses)
+		}
+		return N.DialParallel(ctx, d, network, destination, destinationAddresses, destinationAddresses[0].Is6(), fallbackDelay)
 	}
 	if len(interfaceType) == 0 {
 		interfaceType = d.networkType
 	}
 	if len(fallbackInterfaceType) == 0 {
 		fallbackInterfaceType = d.fallbackNetworkType
-	}
-	if fallbackDelay == 0 {
-		fallbackDelay = d.networkFallbackDelay
 	}
 	var dialer net.Dialer
 	if N.NetworkName(network) == N.NetworkTCP {
@@ -384,15 +382,15 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 		err       error
 	)
 	if !fastFallback {
-		conn, isPrimary, err = d.dialParallelInterface(ctx, dialer, network, address, *strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+		conn, isPrimary, err = d.dialParallelInterface(ctx, dialer, network, destination, destinationAddresses, *strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	} else {
-		conn, isPrimary, err = d.dialParallelInterfaceFastFallback(ctx, dialer, network, address, *strategy, interfaceType, fallbackInterfaceType, fallbackDelay, d.networkLastFallback.Store)
+		conn, isPrimary, err = d.dialParallelInterfaceFastFallback(ctx, dialer, network, destination, destinationAddresses, *strategy, interfaceType, fallbackInterfaceType, fallbackDelay, d.networkLastFallback.Store)
 	}
 	if err != nil {
 		// bind interface failed on legacy xiaomi systems
 		if d.defaultNetworkStrategy && errors.Is(err, syscall.EPERM) {
-			d.networkStrategy = nil
-			return d.DialContext(ctx, network, address)
+			d.canUseNetworkStrategy.Store(false)
+			return d.DialParallelNetwork(ctx, network, destination, destinationAddresses, nil, nil, nil, fallbackDelay)
 		} else {
 			return nil, err
 		}
@@ -403,11 +401,11 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 	if d.quicOpener && N.NetworkName(network) == N.NetworkUDP {
 		writeQUICOpener(conn)
 	}
-	return d.trackConn(ctx, address, conn, nil)
+	return conn, nil
 }
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	if d.networkStrategy == nil {
+	if d.networkStrategy == nil || !d.canUseNetworkStrategy.Load() {
 		packetConn, err := listener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
 			listenConfig := d.udpListener
 			if d.autoDetectBindFunc != nil {
@@ -431,7 +429,7 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 		}
 		return d.trackPacketConn(ctx, destination, packetConn, err)
 	} else {
-		return d.ListenSerialInterfacePacket(ctx, destination, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay)
+		return d.listenSerialInterfacePacket(ctx, destination, nil, nil, nil)
 	}
 }
 
@@ -450,8 +448,25 @@ func (d *DefaultDialer) ICMPControl() control.Func {
 	})
 }
 
-func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destination M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, error) {
-	if strategy == nil {
+func (d *DefaultDialer) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, destinationAddresses []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, netip.Addr, error) {
+	if len(destinationAddresses) == 0 {
+		destinationAddresses = []netip.Addr{destination.Addr}
+	}
+	var errors []error
+	for _, address := range destinationAddresses {
+		packetConn, err := d.listenSerialInterfacePacket(ctx, M.SocksaddrFrom(address, destination.Port), strategy, interfaceType, fallbackInterfaceType)
+		if err == nil {
+			return packetConn, address, nil
+		}
+		errors = append(errors, err)
+	}
+	return nil, netip.Addr{}, E.Errors(errors...)
+}
+
+func (d *DefaultDialer) listenSerialInterfacePacket(ctx context.Context, destination M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType) (net.PacketConn, error) {
+	if d.networkStrategy == nil || !d.canUseNetworkStrategy.Load() {
+		strategy = nil
+	} else if strategy == nil {
 		strategy = d.networkStrategy
 	}
 	if strategy == nil {
@@ -473,7 +488,7 @@ func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destina
 	if err != nil {
 		// bind interface failed on legacy xiaomi systems
 		if d.defaultNetworkStrategy && errors.Is(err, syscall.EPERM) {
-			d.networkStrategy = nil
+			d.canUseNetworkStrategy.Store(false)
 			return d.ListenPacket(ctx, destination)
 		} else {
 			return nil, err

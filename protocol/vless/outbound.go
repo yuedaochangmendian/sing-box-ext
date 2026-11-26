@@ -2,9 +2,7 @@ package vless
 
 import (
 	"context"
-	"encoding/base64"
 	"net"
-	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -14,7 +12,6 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/vless/encryption"
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless"
@@ -48,7 +45,6 @@ type Outbound struct {
 	transport       adapter.V2RayClientTransport
 	packetAddr      bool
 	xudp            bool
-	encryption      *encryption.ClientInstance
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
@@ -64,10 +60,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	if options.TLS != nil {
 		outbound.tlsConfig, err = tls.NewClientWithOptions(tls.ClientOptions{
-			Context:       ctx,
-			Logger:        logger,
-			ServerAddress: options.Server,
-			Options:       common.PtrValueOrDefault(options.TLS),
+			Context:        ctx,
+			Logger:         logger,
+			ServerAddress:  options.Server,
+			Options:        common.PtrValueOrDefault(options.TLS),
+			DomainResolver: options.DomainResolver,
 			KTLSCompatible: common.PtrValueOrDefault(options.Transport).Type == "" &&
 				!common.PtrValueOrDefault(options.Multiplex).Enabled &&
 				options.Flow == "",
@@ -75,10 +72,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, err
 		}
-		outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+		if outbound.tlsConfig != nil {
+			outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+		}
 	}
 	if options.Transport != nil {
-		outbound.transport, err = v2ray.NewClientTransportWithLogger(ctx, logger, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
+		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
 		if err != nil {
 			return nil, E.Cause(err, "create client transport: ", options.Transport.Type)
 		}
@@ -95,18 +94,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		default:
 			return nil, E.New("unknown packet encoding: ", *options.PacketEncoding)
 		}
-	}
-	if options.Encryption != "" && options.Encryption != "none" {
-		encryptionConfig, err := parseClientEncryption(options.Encryption)
-		if err != nil {
-			return nil, E.Cause(err, "parse encryption")
-		}
-		outbound.encryption = &encryption.ClientInstance{}
-		err = outbound.encryption.Init(encryptionConfig.keys, encryptionConfig.xorMode, encryptionConfig.seconds, encryptionConfig.padding)
-		if err != nil {
-			return nil, E.Cause(err, "initialize encryption")
-		}
-		logger.Debug("encryption initialized: keys=", len(encryptionConfig.keys), " xorMode=", encryptionConfig.xorMode, " seconds=", encryptionConfig.seconds, " padding=", encryptionConfig.padding)
 	}
 	outbound.client, err = vless.NewClient(options.UUID, options.Flow, logger)
 	if err != nil {
@@ -217,15 +204,6 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 	if err != nil {
 		return nil, err
 	}
-	if h.encryption != nil {
-		var encryptionConn net.Conn
-		encryptionConn, err = h.encryption.Handshake(conn)
-		if err != nil {
-			common.Close(conn)
-			return nil, E.Cause(err, "encryption handshake")
-		}
-		conn = encryptionConn
-	}
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
@@ -236,12 +214,10 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 			return h.client.DialEarlyXUDPPacketConn(conn, destination)
 		} else if h.packetAddr {
 			if destination.IsDomain() {
-				common.Close(conn)
 				return nil, E.New("packetaddr: domain destination is not supported")
 			}
 			packetConn, err := h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress})
 			if err != nil {
-				common.Close(conn)
 				return nil, err
 			}
 			return bufio.NewBindPacketConn(packetaddr.NewConn(packetConn, destination), destination), nil
@@ -271,97 +247,18 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		common.Close(conn)
 		return nil, err
 	}
-	if h.encryption != nil {
-		var encryptionConn net.Conn
-		encryptionConn, err = h.encryption.Handshake(conn)
-		if err != nil {
-			common.Close(conn)
-			return nil, E.Cause(err, "encryption handshake")
-		}
-		conn = encryptionConn
-	}
 	if h.xudp {
 		return h.client.DialEarlyXUDPPacketConn(conn, destination)
 	} else if h.packetAddr {
 		if destination.IsDomain() {
-			common.Close(conn)
 			return nil, E.New("packetaddr: domain destination is not supported")
 		}
-		packetConn, err := h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress})
+		conn, err := h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress})
 		if err != nil {
-			common.Close(conn)
 			return nil, err
 		}
-		return packetaddr.NewConn(packetConn, destination), nil
+		return packetaddr.NewConn(conn, destination), nil
 	} else {
 		return h.client.DialEarlyPacketConn(conn, destination)
 	}
-}
-
-type clientEncryptionConfig struct {
-	keys    [][]byte
-	xorMode uint32
-	seconds uint32
-	padding string
-}
-
-func parseClientEncryption(raw string) (clientEncryptionConfig, error) {
-	var cfg clientEncryptionConfig
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return cfg, E.New("empty encryption string")
-	}
-	parts := strings.Split(raw, ".")
-	if len(parts) < 4 {
-		return cfg, E.New("invalid encryption string: missing components")
-	}
-	if parts[0] != "mlkem768x25519plus" {
-		return cfg, E.New("unsupported encryption prefix: ", parts[0])
-	}
-	switch parts[1] {
-	case "native":
-		cfg.xorMode = 0
-	case "xorpub":
-		cfg.xorMode = 1
-	case "random":
-		cfg.xorMode = 2
-	default:
-		return cfg, E.New("unknown encryption mode: ", parts[1])
-	}
-	switch parts[2] {
-	case "0rtt":
-		cfg.seconds = 1
-	case "1rtt":
-		cfg.seconds = 0
-	default:
-		return cfg, E.New("unsupported encryption RTT value: ", parts[2])
-	}
-	paddingPhase := true
-	var paddingParts []string
-	for _, segment := range parts[3:] {
-		segment = strings.TrimSpace(segment)
-		if segment == "" {
-			return cfg, E.New("invalid empty segment in encryption string")
-		}
-		if data, err := base64.RawURLEncoding.DecodeString(segment); err == nil {
-			if len(data) == 32 || len(data) == 1184 {
-				cfg.keys = append(cfg.keys, data)
-				paddingPhase = false
-				continue
-			}
-			return cfg, E.New("invalid encryption key length: ", len(data))
-		}
-		if paddingPhase {
-			paddingParts = append(paddingParts, segment)
-			continue
-		}
-		return cfg, E.New("invalid encryption key: ", segment)
-	}
-	if len(cfg.keys) == 0 {
-		return cfg, E.New("no valid encryption keys found in encryption string")
-	}
-	if len(paddingParts) > 0 {
-		cfg.padding = strings.Join(paddingParts, ".")
-	}
-	return cfg, nil
 }

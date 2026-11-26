@@ -22,7 +22,6 @@ require (
 	github.com/jsimonetti/rtnetlink v1.4.1
 	github.com/keybase/go-keychain v0.0.1
 	github.com/klauspost/compress v1.19.1
-	github.com/klauspost/cpuid/v2 v2.3.0
 	github.com/libdns/acmedns v0.5.0
 	github.com/libdns/alidns v1.0.6
 	github.com/libdns/cloudflare v0.2.2
@@ -30,7 +29,7 @@ require (
 	github.com/logrusorgru/aurora v2.0.3+incompatible
 	github.com/mattn/go-runewidth v0.0.27
 	github.com/mdlayher/netlink v1.11.2
-	github.com/metacubex/utls v1.8.7
+	github.com/metacubex/utls v1.9.0-alpha.1
 	github.com/mholt/acmez/v3 v3.1.6
 	github.com/miekg/dns v1.1.72
 	github.com/openai/openai-go/v3 v3.26.0
@@ -38,33 +37,33 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/pkg/sftp v1.13.10
 	github.com/sagernet/asc-go v0.0.0-20260914163356-9e3d45a797c1
-	github.com/sagernet/bbolt v0.0.0-20260915102804-500ee1e84832
+	github.com/sagernet/bbolt v0.0.0-20261124060517-2ab7bd6d2bff
 	github.com/sagernet/cors v1.2.1
 	github.com/sagernet/cronet-go v0.0.0-20261023060337-b3c2ed82ac97
 	github.com/sagernet/cronet-go/all v0.0.0-20261023060337-b3c2ed82ac97
 	github.com/sagernet/fswatch v0.1.2
 	github.com/sagernet/gliderssh v0.3.4-0.20261023092853-e0cad6d28647
 	github.com/sagernet/gomobile v0.1.12
-	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf
-	github.com/sagernet/nftables v0.3.0-mod.4
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.13
-	github.com/sagernet/sing v0.9.7-0.20261110095940-27b73774b240
-	github.com/sagernet/sing-anytls v0.0.0-20260928104022-580984e4d8cb
-	github.com/sagernet/sing-cloudflared v0.1.4-0.20261108120326-83391fb7b139
-	github.com/sagernet/sing-mux v0.3.10-0.20261110064256-375087483ea2
-	github.com/sagernet/sing-openconnect v0.1.1-0.20261110063215-cd35f41e8f69
-	github.com/sagernet/sing-openvpn v0.1.1-0.20261110111939-ad7a6ce7d11b
-	github.com/sagernet/sing-quic v0.7.2-0.20261109110824-5253224b67cf
+	github.com/sagernet/netlink v0.0.0-20261125120807-b006b90aa077
+	github.com/sagernet/nftables v0.3.0-mod.4.0.20261114074246-0b310c3e010b
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.15
+	github.com/sagernet/sing v0.9.7-0.20261125122036-9b11dbe28a7d
+	github.com/sagernet/sing-anytls v0.0.0-20261124060518-f3865241cc12
+	github.com/sagernet/sing-cloudflared v0.1.4-0.20261125132439-71e2e5ed8ed0
+	github.com/sagernet/sing-mux v0.3.10-0.20261125130604-1dd833b8fc3a
+	github.com/sagernet/sing-openconnect v0.1.1-0.20261119021124-31db24231feb
+	github.com/sagernet/sing-openvpn v0.1.1-0.20261125120933-28a40b4ceb1f
+	github.com/sagernet/sing-quic v0.7.2-0.20261124143824-14ca3448d44b
 	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
 	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20261110092058-52ade8ab7e95
-	github.com/sagernet/sing-shadowtls v0.2.2-0.20261110092247-ce8a3b8474bb
-	github.com/sagernet/sing-snell v0.0.0-20261110094602-04667b0a321c
-	github.com/sagernet/sing-tun v0.9.7-0.20261109145802-79ed0653fdc6
+	github.com/sagernet/sing-shadowtls v0.2.2-0.20261125124310-5028b2558ebf
+	github.com/sagernet/sing-snell v0.0.0-20261125120456-6dfe590430a8
+	github.com/sagernet/sing-tun v0.9.7-0.20261125154233-2e93ae4ab5ab
 	github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca
-	github.com/sagernet/sing-vmess v0.2.9-0.20261110093549-d800eb57f96c
+	github.com/sagernet/sing-vmess v0.2.9-0.20261124075649-4acc92a6f6c6
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1
 	github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20261028024127-670967df7dbf
-	github.com/sagernet/wireguard-go v0.0.8-0.20261022215849-fdf0ad046586
+	github.com/sagernet/wireguard-go v0.0.8-0.20261125120826-57cdac3d7d2c
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.0
@@ -74,19 +73,18 @@ require (
 	go.uber.org/zap v1.27.1
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
-	golang.org/x/crypto v0.54.0
+	golang.org/x/crypto v0.55.0
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f
-	golang.org/x/mod v0.37.0
-	golang.org/x/net v0.57.0
+	golang.org/x/mod v0.38.0
+	golang.org/x/net v0.58.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
-	golang.org/x/text v0.40.0
+	golang.org/x/text v0.41.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 	google.golang.org/grpc v1.79.1
 	google.golang.org/protobuf v1.36.11
 	howett.net/plist v1.0.1
-	lukechampine.com/blake3 v1.3.0
 )
 
 require (
@@ -102,7 +100,6 @@ require (
 	github.com/axiomhq/hyperloglog v0.0.0-20240319100328-84253e514e02 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
-	github.com/cloudflare/circl v1.6.5 // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
 	github.com/database64128/netx-go v0.1.1 // indirect
@@ -132,6 +129,7 @@ require (
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
+	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.12.0 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/kr/fs v0.1.0 // indirect
@@ -197,14 +195,17 @@ require (
 	go.uber.org/zap/exp v0.3.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	lukechampine.com/blake3 v1.3.0 // indirect
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/wireguard-go => github.com/throneproj/wireguard-go v0.0.0-20261112143559-827ce83a4eed
+replace github.com/sagernet/wireguard-go => github.com/throneproj/wireguard-go v0.0.0-20261125171605-f0b599c95a2a
 
-replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.4-0.20261113121621-2ce66de7d09b
+replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.4-0.20261125171526-5979c7963e80
+
+replace github.com/sagernet/sing-openvpn => github.com/throneproj/sing-openvpn v0.1.1-0.20261125171531-a4fa5f58f661

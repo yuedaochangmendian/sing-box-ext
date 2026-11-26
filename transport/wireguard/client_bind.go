@@ -14,8 +14,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/service"
-	"github.com/sagernet/sing/service/pause"
 	"github.com/sagernet/wireguard-go/conn"
 )
 
@@ -24,7 +22,6 @@ var _ conn.Bind = (*ClientBind)(nil)
 type ClientBind struct {
 	ctx                 context.Context
 	logger              logger.Logger
-	pauseManager        pause.Manager
 	bindCtx             context.Context
 	bindDone            context.CancelFunc
 	dialer              N.Dialer
@@ -32,33 +29,39 @@ type ClientBind struct {
 	reservedForEndpoint map[netip.AddrPort][3]uint8
 	endpointReserved    atomic.Bool
 	connAccess          sync.Mutex
-	conn                *wireConn
+	conn                atomic.Pointer[wireConn]
 	done                chan struct{}
+	destination         M.Socksaddr
 	isConnect           bool
-	connectAddr         M.Socksaddr
 	reserved            [3]uint8
+	onRedial            func()
+	redialForSend       atomic.Bool
 }
 
-func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, isConnect bool, connectAddr M.Socksaddr, reserved [3]uint8) *ClientBind {
+// SetRedialHandler sets what runs, on its own goroutine, after a flow is dialed
+// in place of one that closed with no send about to go out on the new one.
+func (c *ClientBind) SetRedialHandler(handler func()) {
+	c.onRedial = handler
+}
+
+func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, destination M.Socksaddr, reserved [3]uint8) *ClientBind {
 	return &ClientBind{
 		ctx:                 ctx,
 		logger:              logger,
-		pauseManager:        service.FromContext[pause.Manager](ctx),
 		dialer:              dialer,
 		reservedForEndpoint: make(map[netip.AddrPort][3]uint8),
 		done:                make(chan struct{}),
-		isConnect:           isConnect,
-		connectAddr:         connectAddr,
+		destination:         destination,
+		isConnect:           destination.IsDomain(),
 		reserved:            reserved,
 	}
 }
 
 func (c *ClientBind) connect() (*wireConn, error) {
-	serverConn := c.conn
+	serverConn := c.conn.Load()
 	if serverConn != nil {
 		select {
 		case <-serverConn.done:
-			serverConn = nil
 		default:
 			return serverConn, nil
 		}
@@ -70,35 +73,39 @@ func (c *ClientBind) connect() (*wireConn, error) {
 		return nil, net.ErrClosed
 	default:
 	}
-	serverConn = c.conn
+	serverConn = c.conn.Load()
 	if serverConn != nil {
 		select {
 		case <-serverConn.done:
-			serverConn = nil
 		default:
 			return serverConn, nil
 		}
 	}
+	replaced := serverConn != nil
 	if c.isConnect {
-		udpConn, err := c.dialer.DialContext(c.bindCtx, N.NetworkUDP, c.connectAddr)
+		udpConn, err := c.dialer.DialContext(c.bindCtx, N.NetworkUDP, c.destination)
 		if err != nil {
 			return nil, err
 		}
-		c.conn = &wireConn{
+		serverConn = &wireConn{
 			PacketConn: bufio.NewUnbindPacketConn(udpConn),
 			done:       make(chan struct{}),
 		}
 	} else {
-		udpConn, err := c.dialer.ListenPacket(c.bindCtx, M.Socksaddr{Addr: netip.IPv4Unspecified()})
+		udpConn, err := c.dialer.ListenPacket(c.bindCtx, c.destination)
 		if err != nil {
 			return nil, err
 		}
-		c.conn = &wireConn{
+		serverConn = &wireConn{
 			PacketConn: bufio.NewPacketConn(udpConn),
 			done:       make(chan struct{}),
 		}
 	}
-	return c.conn, nil
+	c.conn.Store(serverConn)
+	if replaced && !c.redialForSend.Swap(false) && c.onRedial != nil {
+		go c.onRedial()
+	}
+	return serverConn, nil
 }
 
 func (c *ClientBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
@@ -121,7 +128,6 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		c.logger.Error(E.Cause(err, "connect to server"))
 		err = nil
-		c.pauseManager.WaitActiveContext(c.bindCtx)
 		select {
 		case <-c.done:
 		case <-time.After(time.Second):
@@ -142,7 +148,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		return
 	}
-	udpConn.unanswered.Store(false)
+	udpConn.unansweredSince.Store(0)
 	sizes[0] = n
 	// Only strip the reserved field when the reserved-bytes feature is in use.
 	// Leaving these bytes intact otherwise keeps AmneziaWG magic headers (which
@@ -150,7 +156,11 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 	if c.hasReserved() && hasReservedField(packets[0][:n]) {
 		clear(packets[0][1:4])
 	}
-	eps[0] = remoteEndpoint{addr: M.SocksaddrFromNet(addr).Unwrap().AddrPort(), bind: c}
+	if c.isConnect {
+		eps[0] = c.connectEndpoint()
+	} else {
+		eps[0] = remoteEndpoint{addr: M.SocksaddrFromNet(addr).Unwrap().AddrPort(), bind: c}
+	}
 	count = 1
 	return
 }
@@ -166,7 +176,7 @@ func (c *ClientBind) Close() error {
 	}
 	c.connAccess.Lock()
 	defer c.connAccess.Unlock()
-	common.Close(common.PtrOrNil(c.conn))
+	common.Close(common.PtrOrNil(c.conn.Load()))
 	return nil
 }
 
@@ -198,36 +208,56 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 				copy(buf[1:4], reserved[:])
 			}
 		}
-		_, err = udpConn.WriteToUDPAddrPort(buf, destination)
+		_, err = udpConn.WriteTo(buf, M.SocksaddrFromNetIP(destination).UDPAddr())
 		if err != nil {
 			udpConn.Close()
 			return err
 		}
 	}
-	udpConn.unanswered.Store(true)
+	udpConn.unansweredSince.CompareAndSwap(0, time.Now().UnixNano())
 	return nil
 }
 
-// closeUnanswered closes the connected flow when it carried a send that got no
-// reply, so that the next send or receive dials a new one. Behind a detour the
-// flow is a single long-lived connection (UDP over a TCP proxy stream, an
-// endpoint's stack) that can stop delivering without ever returning an error,
-// e.g. after the device slept and a NAT or the server dropped it silently. A
-// listening bind shares its flow between peers and is left alone.
+// A detour can take seconds to carry a new flow's first reply (a new UDP
+// association, the proxy's dial, the server's own), longer than the 5 s between
+// handshake retries; replacing the flow at each retry would make every one pay
+// that again, so only a flow silent this long is taken for dead.
+const unansweredFlowTimeout = 15 * time.Second
+
+// closeUnanswered closes the single peer's flow when its sends have gone unanswered
+// for unansweredFlowTimeout, so that the next send or receive opens a new one.
+// Behind a detour the flow is a single long-lived connection (UDP over a TCP
+// proxy stream, an endpoint's stack) that can stop delivering without ever
+// returning an error, e.g. after the device slept and a NAT or the server
+// dropped it silently. A bind without a peer address shares its flow between
+// peers and is left alone.
 func (c *ClientBind) closeUnanswered() {
-	// Held while a new flow is dialed (or the bind closes): nothing to replace then,
+	// Held while a new flow is opened (or the bind closes): nothing to replace then,
 	// and waiting would hold up the peer behind the dial.
-	if !c.isConnect || !c.connAccess.TryLock() {
+	if c.destination.Addr.IsUnspecified() || !c.connAccess.TryLock() {
 		return
 	}
-	serverConn := c.conn
+	serverConn := c.conn.Load()
 	c.connAccess.Unlock()
-	if serverConn == nil || !serverConn.unanswered.Load() {
+	if serverConn == nil {
 		return
 	}
+	// Wall clock, so that time the device slept counts as silence.
+	since := serverConn.unansweredSince.Load()
+	if since == 0 || time.Since(time.Unix(0, since)) < unansweredFlowTimeout {
+		return
+	}
+	// ClearSrc runs right before a send, which goes out on the replacement.
+	c.redialForSend.Store(true)
 	if serverConn.Close() == nil {
 		c.logger.Debug("no reply from server, reconnecting")
 	}
+}
+
+// In connect mode the flow is the path to the domain peer, so every packet has this
+// one endpoint, with no address, whatever address the detour reports.
+func (c *ClientBind) connectEndpoint() remoteEndpoint {
+	return remoteEndpoint{bind: c}
 }
 
 func (c *ClientBind) ParseEndpoint(s string) (conn.Endpoint, error) {
@@ -271,17 +301,10 @@ func hasReservedField(b []byte) bool {
 
 type wireConn struct {
 	net.PacketConn
-	conn       net.Conn
-	access     sync.Mutex
-	done       chan struct{}
-	unanswered atomic.Bool
-}
-
-func (w *wireConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
-	if w.conn != nil {
-		return w.conn.Write(b)
-	}
-	return w.PacketConn.WriteTo(b, M.SocksaddrFromNetIP(addr).UDPAddr())
+	access sync.Mutex
+	done   chan struct{}
+	// Unix nanoseconds of the first send since the last reply, 0 when answered.
+	unansweredSince atomic.Int64
 }
 
 func (w *wireConn) Close() error {

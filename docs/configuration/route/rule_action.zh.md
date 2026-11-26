@@ -2,6 +2,10 @@
 icon: material/new-box
 ---
 
+!!! quote "sing-box 1.15.0 中的更改"
+
+    :material-plus: [tcp_prefix](#tcp_prefix)
+
 !!! quote "sing-box 1.13.0 中的更改"
 
     :material-plus: [bypass](#bypass)  
@@ -139,6 +143,7 @@ icon: material/new-box
   "override_port": 0,
   "network_strategy": "",
   "fallback_delay": "",
+  "tcp_prefix": "",
   "udp_disable_domain_unmapping": false,
   "udp_connect": false,
   "udp_timeout": "",
@@ -171,17 +176,17 @@ icon: material/new-box
 仅当出站为 `direct` 且 `outbound.bind_interface`, `outbound.inet4_bind_address`
 且 `outbound.inet6_bind_address` 未设置时生效。
 
-#### network_type
-
-详情参阅 [拨号字段](/zh/configuration/shared/dial/#network_type)。
-
-#### fallback_network_type
-
-详情参阅 [拨号字段](/zh/configuration/shared/dial/#fallback_network_type)。
-
 #### fallback_delay
 
 详情参阅 [拨号字段](/zh/configuration/shared/dial/#fallback_delay)。
+
+#### tcp_prefix
+
+!!! question "自 sing-box 1.15.0 起"
+
+在每个 TCP 连接的开头添加数据。
+
+使用 Base64 字符串或字节数组。
 
 #### udp_disable_domain_unmapping
 
@@ -275,8 +280,6 @@ UDP 连接超时时间。
 ```
 
 `sniff` 对连接执行协议嗅探。
-
-对于已弃用的 `inbound.sniff` 选项，被视为在路由之前执行的 `sniff`。
 
 #### sniffer
 

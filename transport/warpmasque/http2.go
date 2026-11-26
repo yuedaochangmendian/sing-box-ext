@@ -33,7 +33,12 @@ type http2Conn struct {
 	closeOnce  sync.Once
 }
 
-func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config, h2Transport *http2.Transport) (Conn, error) {
+// HTTP2Handshake is a TLS connection past its handshake that carries no tunnel yet.
+type HTTP2Handshake struct {
+	tlsConn tls.Conn
+}
+
+func HandshakeHTTP2(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config) (*HTTP2Handshake, error) {
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
 	tcpConn, err := dialer.DialContext(ctx, N.NetworkTCP, destination)
@@ -50,9 +55,14 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 		tlsConn.Close()
 		return nil, E.New("server negotiated ", protocol, " instead of HTTP/2")
 	}
-	clientConn, err := h2Transport.NewClientConn(tlsConn)
+	return &HTTP2Handshake{tlsConn: tlsConn}, nil
+}
+
+// Open sends the CONNECT request and consumes the handshake, closing it on failure; the tunnel ends with lifetime.
+func (h *HTTP2Handshake) Open(ctx context.Context, lifetime context.Context, h2Transport *http2.Transport) (Conn, error) {
+	clientConn, err := h2Transport.NewClientConn(h.tlsConn)
 	if err != nil {
-		tlsConn.Close()
+		h.tlsConn.Close()
 		return nil, err
 	}
 	pipeReader, pipeWriter := io.Pipe()
@@ -60,7 +70,7 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 	streamCtx, cancel, dialed := newStreamContext(lifetime, ctx)
 	conn := &http2Conn{
 		ctx:        streamCtx,
-		tlsConn:    tlsConn,
+		tlsConn:    h.tlsConn,
 		clientConn: clientConn,
 		cancel:     cancel,
 		pipeWriter: pipeWriter,
@@ -81,6 +91,7 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 	response, err := clientConn.RoundTrip(request.WithContext(streamCtx))
 	dialed()
 	if err != nil {
+		err = conn.readError(err)
 		conn.closeWithError(err)
 		return nil, err
 	}
@@ -92,6 +103,10 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 	}
 	conn.parser = http3.NewCapsuleParser(response.Body)
 	return conn, nil
+}
+
+func (h *HTTP2Handshake) Close() error {
+	return h.tlsConn.Close()
 }
 
 func (c *http2Conn) ReadPacket(buffer *buf.Buffer) error {

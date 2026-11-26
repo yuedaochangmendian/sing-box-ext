@@ -3,10 +3,8 @@ package route
 import (
 	"context"
 	"net"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	dnsOutbound "github.com/sagernet/sing-box/protocol/dns"
 	R "github.com/sagernet/sing-box/route/rule"
@@ -18,27 +16,25 @@ import (
 )
 
 func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
-	r.searchProcessInfo(ctx, &metadata)
-	metadata.Destination = M.Socksaddr{}
+	if r.dnsFindProcess.Load() {
+		r.searchProcessInfo(ctx, &metadata)
+	}
 	err := N.ReportConnHandshakeSuccess(conn, conn)
 	if err != nil {
 		return E.Cause(err, "report handshake success")
 	}
-	for {
-		conn.SetReadDeadline(time.Now().Add(C.DNSTimeout))
-		err = dnsOutbound.HandleStreamDNSRequest(ctx, r.dns, conn, metadata)
-		if err != nil {
-			if !E.IsClosedOrCanceled(err) {
-				return err
-			} else {
-				return nil
-			}
-		}
+	err = dnsOutbound.NewDNSConnection(ctx, r.dns, conn, metadata)
+	if E.IsClosedOrCanceled(err) {
+		conn.Close()
+		return nil
 	}
+	return err
 }
 
 func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetBuffers []*N.PacketBuffer, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-	r.searchProcessInfo(ctx, &metadata)
+	if r.dnsFindProcess.Load() {
+		r.searchProcessInfo(ctx, &metadata)
+	}
 	err := N.ReportPacketConnHandshakeSuccess(conn, nil)
 	if err != nil {
 		N.ReleaseMultiPacketBuffer(packetBuffers)
@@ -60,12 +56,23 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 		r.logger.ErrorContext(ctx, E.Cause(err, "process DNS packet: unpack request"))
 		return
 	}
-	r.searchProcessInfo(ctx, &metadata)
+	if r.dnsFindProcess.Load() {
+		// The caller is the inbound's packet loop, which must not wait for an owner lookup.
+		go func() {
+			r.searchProcessInfo(ctx, &metadata)
+			r.exchangeDNSPacket(ctx, &message, writer, metadata)
+		}()
+		return
+	}
+	r.exchangeDNSPacket(ctx, &message, writer, metadata)
+}
+
+func (r *Router) exchangeDNSPacket(ctx context.Context, message *mDNS.Msg, writer N.PacketWriter, metadata adapter.InboundContext) {
 	destination := metadata.Destination
 	metadata.Destination = M.Socksaddr{}
-	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
+	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
 		if exchangeErr == nil {
-			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
+			exchangeErr = r.writeDNSPacketResponse(message, response, writer, destination)
 		}
 		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) {
 			r.logger.ErrorContext(ctx, E.Cause(exchangeErr, "process DNS packet"))
