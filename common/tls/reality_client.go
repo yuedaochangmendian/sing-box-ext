@@ -83,8 +83,6 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid short_id")
 	}
 
-	// Xray post-quantum REALITY: an ML-DSA-65 verify key requires the extra
-	// signature in the certificate extension. Empty keeps classic REALITY.
 	var mldsa65Verify []byte
 	if options.Reality.MLDSA65Verify != "" {
 		mldsa65Verify, err = base64.RawURLEncoding.DecodeString(options.Reality.MLDSA65Verify)
@@ -169,8 +167,6 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		return nil, err
 	}
 	verifier.UConn = uConn
-	// Xray v26.9.8+ REALITY rejects a ClientHello with no hybrid X25519MLKEM768
-	// share; newRealityUConn adds one to fingerprints that predate ML-KEM.
 	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
 			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
@@ -206,8 +202,6 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 	ecdheKey := keyShareKeys.Ecdhe
 	keyShareName := "x25519"
-	// Servers derive the auth key from the standalone X25519 share when
-	// offered; the X25519 half of the hybrid share is the fallback.
 	if ecdheKey == nil {
 		ecdheKey = keyShareKeys.MlkemEcdhe
 		keyShareName = "x25519mlkem768"
@@ -247,8 +241,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 
 	if !verifier.verified {
 		if debug.Enabled {
-			fmt.Printf("REALITY verification failed (auth key from %s, standalone X25519 share present: %v, hybrid X25519MLKEM768 share present: %v, fingerprint: %s-%s)\n",
-				keyShareName, keyShareKeys.Ecdhe != nil, keyShareKeys.MlkemEcdhe != nil, e.uClient.id.Client, e.uClient.id.Version)
+			fmt.Printf("REALITY verification failed (auth key from %s, standalone X25519 share present: %v, hybrid X25519MLKEM768 share present: %v)\n", keyShareName, keyShareKeys.Ecdhe != nil, keyShareKeys.MlkemEcdhe != nil)
 		}
 		realityClientFallback(ctx, uConn, e.uClient.ServerName(), e.uClient.id)
 		return nil, E.New("reality verification failed")
@@ -393,16 +386,11 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
 				c.verified = true
 				return nil
 			}
-			// Xray post-quantum REALITY: HMAC(pub || ClientHello || ServerHello)
-			// verified against the ML-DSA-65 signature in the first extension.
-			if len(c.HandshakeState.Hello.Raw) > 0 &&
-				len(c.HandshakeState.ServerHello.Raw) > 0 &&
-				len(certs[0].Extensions) > 0 {
+			if len(c.HandshakeState.Hello.Raw) > 0 && len(c.HandshakeState.ServerHello.Raw) > 0 && len(certs[0].Extensions) > 0 {
 				h.Write(c.HandshakeState.Hello.Raw)
 				h.Write(c.HandshakeState.ServerHello.Raw)
-				if verifyKey, err := mldsa65.Scheme().UnmarshalBinaryPublicKey(c.mldsa65Verify); err == nil {
-					if publicKey, isMLDSA := verifyKey.(*mldsa65.PublicKey); isMLDSA &&
-						mldsa65.Verify(publicKey, h.Sum(nil), nil, certs[0].Extensions[0].Value) {
+				if key, err := mldsa65.Scheme().UnmarshalBinaryPublicKey(c.mldsa65Verify); err == nil {
+					if pk, ok := key.(*mldsa65.PublicKey); ok && mldsa65.Verify(pk, h.Sum(nil), nil, certs[0].Extensions[0].Value) {
 						c.verified = true
 						return nil
 					}
