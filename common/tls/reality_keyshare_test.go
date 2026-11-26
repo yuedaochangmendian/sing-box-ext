@@ -14,9 +14,12 @@ func TestEnsureMLKEMKeyShareAddsTheHybridShare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	changed, usable := ensureMLKEMKeyShare(&spec)
-	if !usable || !changed {
-		t.Fatalf("the firefox spec was expected to gain the hybrid key share: changed=%v usable=%v", changed, usable)
+	_, usable := ensureMLKEMKeyShare(&spec)
+	// Newer uTLS builds already carry X25519MLKEM768 in the Firefox spec, so
+	// `changed` may be false; what matters is that the spec can carry the
+	// hybrid share (and that the generated ClientHello does so, checked below).
+	if !usable {
+		t.Fatal("the firefox spec cannot carry a TLS 1.3 hybrid key share")
 	}
 	client, server := net.Pipe()
 	defer client.Close()

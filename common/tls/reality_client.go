@@ -35,6 +35,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	aTLS "github.com/sagernet/sing/common/tls"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	utls "github.com/metacubex/utls"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
@@ -43,9 +44,10 @@ import (
 var _ ConfigCompat = (*RealityClientConfig)(nil)
 
 type RealityClientConfig struct {
-	uClient   *UTLSClientConfig
-	publicKey []byte
-	shortID   [8]byte
+	uClient       *UTLSClientConfig
+	publicKey     []byte
+	shortID       [8]byte
+	mldsa65Verify []byte
 }
 
 func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
@@ -81,7 +83,24 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid short_id")
 	}
 
-	var config Config = &RealityClientConfig{uClient.(*UTLSClientConfig), publicKey, shortID}
+	// Xray post-quantum REALITY: an ML-DSA-65 verify key requires the extra
+	// signature in the certificate extension. Empty keeps classic REALITY.
+	var mldsa65Verify []byte
+	if options.Reality.MLDSA65Verify != "" {
+		mldsa65Verify, err = base64.RawURLEncoding.DecodeString(options.Reality.MLDSA65Verify)
+		if err != nil {
+			return nil, E.Cause(err, "decode mldsa65_verify")
+		}
+		if len(mldsa65Verify) != mldsa65.PublicKeySize {
+			return nil, E.New("invalid mldsa65_verify")
+		}
+	}
+	var config Config = &RealityClientConfig{
+		uClient:       uClient.(*UTLSClientConfig),
+		publicKey:     publicKey,
+		shortID:       shortID,
+		mldsa65Verify: mldsa65Verify,
+	}
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -137,16 +156,30 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		nowTime = time.Now()
 	}
 	verifier := &realityVerifier{
-		serverName:  e.uClient.ServerName(),
-		rootCAs:     uConfig.RootCAs,
-		currentTime: nowTime,
+		serverName:    e.uClient.ServerName(),
+		rootCAs:       uConfig.RootCAs,
+		currentTime:   nowTime,
+		mldsa65Verify: e.mldsa65Verify,
 	}
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
+	uConn, err := newRealityUConn(conn, uConfig, e.uClient.id)
+	if err != nil {
+		return nil, err
+	}
 	verifier.UConn = uConn
-	err := uConn.BuildHandshakeState()
+	// Xray v26.9.8+ REALITY rejects a ClientHello with no hybrid X25519MLKEM768
+	// share; newRealityUConn adds one to fingerprints that predate ML-KEM.
+	if len(uConfig.NextProtos) > 0 {
+		for _, extension := range uConn.Extensions {
+			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+				alpnExtension.AlpnProtocols = uConfig.NextProtos
+				break
+			}
+		}
+	}
+	err = uConn.BuildHandshakeState()
 	if err != nil {
 		return nil, err
 	}
@@ -172,6 +205,13 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 		return nil, E.New("nil KeyShareKeys")
 	}
 	ecdheKey := keyShareKeys.Ecdhe
+	keyShareName := "x25519"
+	// Servers derive the auth key from the standalone X25519 share when
+	// offered; the X25519 half of the hybrid share is the fallback.
+	if ecdheKey == nil {
+		ecdheKey = keyShareKeys.MlkemEcdhe
+		keyShareName = "x25519mlkem768"
+	}
 	if ecdheKey == nil {
 		return nil, E.New("nil ecdheKey")
 	}
@@ -206,11 +246,93 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 
 	if !verifier.verified {
+		if debug.Enabled {
+			fmt.Printf("REALITY verification failed (auth key from %s, standalone X25519 share present: %v, hybrid X25519MLKEM768 share present: %v, fingerprint: %s-%s)\n",
+				keyShareName, keyShareKeys.Ecdhe != nil, keyShareKeys.MlkemEcdhe != nil, e.uClient.id.Client, e.uClient.id.Version)
+		}
 		realityClientFallback(ctx, uConn, e.uClient.ServerName(), e.uClient.id)
 		return nil, E.New("reality verification failed")
 	}
 
 	return &realityClientConnWrapper{uConn}, nil
+}
+
+// newRealityUConn builds the uTLS connection for [id]. REALITY servers from
+// Xray v26.9.8 on reject a ClientHello that carries no X25519MLKEM768 key
+// share, so a fingerprint that predates ML-KEM gets one before its spec is
+// applied. The configured fingerprint is kept: only the curve list and the key
+// share extension gain the group, everything else is the fingerprint's own.
+func newRealityUConn(conn net.Conn, config *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
+	spec, err := utls.UTLSIdToSpec(id)
+	if err != nil {
+		// HelloRandomized builds its spec per connection, HelloCustom and
+		// HelloGolang have none. REALITY cannot add a key share to any of them,
+		// so fall back to Chrome, the modern preset every REALITY server
+		// accepts.
+		return utls.UClient(conn, config, utls.HelloChrome_Auto), nil
+	}
+	changed, usable := ensureMLKEMKeyShare(&spec)
+	if !usable {
+		// TLS 1.2-only presets (360, Android 11) have no key share extension;
+		// REALITY is TLS 1.3 only, so their spec can never carry the handshake.
+		return utls.UClient(conn, config, utls.HelloChrome_Auto), nil
+	}
+	if !changed {
+		return utls.UClient(conn, config, id), nil
+	}
+	// ApplyPreset needs HelloCustom: the spec is what goes on the wire, and the
+	// configured id no longer describes it.
+	uConn := utls.UClient(conn, config, utls.HelloCustom)
+	if err := uConn.ApplyPreset(&spec); err != nil {
+		return nil, err
+	}
+	return uConn, nil
+}
+
+// ensureMLKEMKeyShare puts the hybrid X25519MLKEM768 group and key share into
+// [spec], first, the order Chrome uses. It reports whether the spec changed and
+// whether the spec can carry a TLS 1.3 REALITY handshake at all.
+func ensureMLKEMKeyShare(spec *utls.ClientHelloSpec) (changed, usable bool) {
+	var curves *utls.SupportedCurvesExtension
+	var keyShares *utls.KeyShareExtension
+	offersTLS13 := spec.TLSVersMax >= utls.VersionTLS13
+	for _, extension := range spec.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves = ext
+		case *utls.KeyShareExtension:
+			keyShares = ext
+		case *utls.SupportedVersionsExtension:
+			for _, version := range ext.Versions {
+				if version == utls.VersionTLS13 {
+					offersTLS13 = true
+				}
+			}
+		}
+	}
+	if keyShares == nil || !offersTLS13 {
+		return false, false
+	}
+	if curves != nil {
+		hasCurve := false
+		for _, curveID := range curves.Curves {
+			if curveID == utls.X25519MLKEM768 {
+				hasCurve = true
+				break
+			}
+		}
+		if !hasCurve {
+			curves.Curves = append([]utls.CurveID{utls.X25519MLKEM768}, curves.Curves...)
+			changed = true
+		}
+	}
+	for _, share := range keyShares.KeyShares {
+		if share.Group == utls.X25519MLKEM768 {
+			return changed, true
+		}
+	}
+	keyShares.KeyShares = append([]utls.KeyShare{{Group: utls.X25519MLKEM768}}, keyShares.KeyShares...)
+	return true, true
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
@@ -246,16 +368,18 @@ func (e *RealityClientConfig) Clone() Config {
 		e.uClient.Clone().(*UTLSClientConfig),
 		e.publicKey,
 		e.shortID,
+		e.mldsa65Verify,
 	}
 }
 
 type realityVerifier struct {
 	*utls.UConn
-	serverName  string
-	rootCAs     *x509.CertPool
-	currentTime time.Time
-	authKey     []byte
-	verified    bool
+	serverName    string
+	rootCAs       *x509.CertPool
+	currentTime   time.Time
+	authKey       []byte
+	mldsa65Verify []byte
+	verified      bool
 }
 
 func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
@@ -265,8 +389,25 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
 		h := hmac.New(sha512.New, c.authKey)
 		h.Write(pub)
 		if bytes.Equal(h.Sum(nil), certs[0].Signature) {
-			c.verified = true
-			return nil
+			if len(c.mldsa65Verify) == 0 {
+				c.verified = true
+				return nil
+			}
+			// Xray post-quantum REALITY: HMAC(pub || ClientHello || ServerHello)
+			// verified against the ML-DSA-65 signature in the first extension.
+			if len(c.HandshakeState.Hello.Raw) > 0 &&
+				len(c.HandshakeState.ServerHello.Raw) > 0 &&
+				len(certs[0].Extensions) > 0 {
+				h.Write(c.HandshakeState.Hello.Raw)
+				h.Write(c.HandshakeState.ServerHello.Raw)
+				if verifyKey, err := mldsa65.Scheme().UnmarshalBinaryPublicKey(c.mldsa65Verify); err == nil {
+					if publicKey, isMLDSA := verifyKey.(*mldsa65.PublicKey); isMLDSA &&
+						mldsa65.Verify(publicKey, h.Sum(nil), nil, certs[0].Extensions[0].Value) {
+						c.verified = true
+						return nil
+					}
+				}
+			}
 		}
 	}
 	opts := x509.VerifyOptions{
